@@ -14,7 +14,54 @@ import (
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
+// ============================================================================
+// SNAPSHOT & DELTA STRUCTURES
+// ============================================================================
 
+// FileSnapshot represents the state of a file at a point in time
+type FileSnapshot struct {
+	Path    string
+	ModTime int64
+	Size    int64
+	IsDir   bool
+	Mode    os.FileMode
+}
+
+// snapshotFilesystem creates a snapshot of all files and directories in root
+func snapshotFilesystem(root string) (map[string]FileSnapshot, error) {
+	snapshot := make(map[string]FileSnapshot)
+	
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // skip inaccessible files
+		}
+		
+		// Get relative path
+		relPath, _ := filepath.Rel(root, path)
+		
+		// Skip the root directory itself
+		if relPath == "." {
+			return nil
+		}
+		
+		fs := FileSnapshot{
+			Path:    relPath,
+			ModTime: info.ModTime().Unix(),
+			Size:    info.Size(),
+			IsDir:   info.IsDir(),
+			Mode:    info.Mode(),
+		}
+		
+		snapshot[relPath] = fs
+		return nil
+	})
+	
+	return snapshot, err
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
 // getLayersDir returns ~/.docksmith/layers/
 func getLayersDir() string {
 	home, _ := os.UserHomeDir()
@@ -117,7 +164,15 @@ func extractSingleLayer(digest, destDir string) error {
 }
 
 // CreateCopyLayer copies files from contextDir into assembledRoot and creates a tar layer
+// CreateCopyLayer copies files from contextDir into assembledRoot and creates a DELTA tar layer
 func CreateCopyLayer(contextDir, assembledRoot, instrArgs string) (string, error) {
+	// 1. Take a SNAPSHOT of assembledRoot BEFORE copying
+	snapshotBefore, err := snapshotFilesystem(assembledRoot)
+	if err != nil {
+		return "", fmt.Errorf("snapshot before copy: %w", err)
+	}
+	
+	// 2. Do the actual COPY
 	// Parse COPY instruction: "SRC DEST" or "SRC1 SRC2 ... DEST"
 	parts := strings.Fields(instrArgs)
 	if len(parts) < 2 {
@@ -161,21 +216,30 @@ func CreateCopyLayer(contextDir, assembledRoot, instrArgs string) (string, error
 		}
 	}
 	
-	// Create tar of the entire root directory
+	// 3. Take a SNAPSHOT AFTER copying
+	snapshotAfter, err := snapshotFilesystem(assembledRoot)
+	if err != nil {
+		return "", fmt.Errorf("snapshot after copy: %w", err)
+	}
+	
+	// 4. Compute DELTA (only changed/new files)
+	delta := computeDeltaForCopy(snapshotBefore, snapshotAfter)
+	
+	// 5. Create tar of ONLY the delta
 	tempTar := filepath.Join(getLayersDir(), "temp_layer.tar")
-	if err := createLayerTar(assembledRoot, tempTar); err != nil {
+	if err := createDeltaTar(assembledRoot, delta, tempTar); err != nil {
 		os.Remove(tempTar)
 		return "", err
 	}
 	
-	// Compute digest
+	// 6. Compute digest
 	digest, err := fileToDigest(tempTar)
 	if err != nil {
 		os.Remove(tempTar)
 		return "", err
 	}
 	
-	// Move to final location
+	// 7. Move to final location
 	finalPath := digestToPath(digest)
 	if err := os.Rename(tempTar, finalPath); err != nil {
 		os.Remove(tempTar)
@@ -184,7 +248,6 @@ func CreateCopyLayer(contextDir, assembledRoot, instrArgs string) (string, error
 	
 	return digest, nil
 }
-
 // copyFile copies a single file from src to dst
 func copyFile(src, dst string) error {
 	srcFile, err := os.Open(src)
@@ -233,7 +296,8 @@ func copyDir(src, dst string) error {
 }
 
 // createLayerTar tars the entire root directory
-func createLayerTar(rootDir, tarPath string) error {
+// createDeltaTar creates a tar archive of only the changed/new files
+func createDeltaTar(root string, delta map[string]FileSnapshot, tarPath string) error {
 	tf, err := os.Create(tarPath)
 	if err != nil {
 		return err
@@ -243,22 +307,16 @@ func createLayerTar(rootDir, tarPath string) error {
 	tw := tar.NewWriter(tf)
 	defer tw.Close()
 	
-	return filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+	for relPath, snapshot := range delta {
+		fullPath := filepath.Join(root, relPath)
+		info, err := os.Stat(fullPath)
 		if err != nil {
-			return err
-		}
-		
-		// Get relative path for tar header
-		relPath, _ := filepath.Rel(rootDir, path)
-		
-		// Skip the root itself
-		if relPath == "." {
-			return nil
+			continue // file was deleted, skip
 		}
 		
 		header, err := tar.FileInfoHeader(info, "")
 		if err != nil {
-			return err
+			continue
 		}
 		header.Name = relPath
 		
@@ -266,21 +324,35 @@ func createLayerTar(rootDir, tarPath string) error {
 			return err
 		}
 		
-		// For directories, just write header; for files, write content
-		if !info.IsDir() {
-			f, err := os.Open(path)
+		// For regular files, write content
+		if !info.IsDir() && info.Mode().IsRegular() {
+			f, err := os.Open(fullPath)
 			if err != nil {
-				return err
+				continue
 			}
-			_, err = io.Copy(tw, f)
+			io.Copy(tw, f)
 			f.Close()
-			return err
 		}
-		
-		return nil
-	})
+	}
+	
+	return nil
 }
 
+// computeDeltaForCopy identifies changed and new files
+func computeDeltaForCopy(before, after map[string]FileSnapshot) map[string]FileSnapshot {
+	delta := make(map[string]FileSnapshot)
+	
+	for path, afterFile := range after {
+		beforeFile, exists := before[path]
+		
+		// New file or file was modified (by ModTime or Size)
+		if !exists || beforeFile.ModTime != afterFile.ModTime || beforeFile.Size != afterFile.Size {
+			delta[path] = afterFile
+		}
+	}
+	
+	return delta
+}
 // HashCopySources computes a deterministic hash of all source files
 func HashCopySources(contextDir, instrArgs string) (string, error) {
 	parts := strings.Fields(instrArgs)

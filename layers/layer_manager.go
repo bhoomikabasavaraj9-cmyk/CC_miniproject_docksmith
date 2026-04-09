@@ -307,7 +307,7 @@ func createDeltaTar(root string, delta map[string]FileSnapshot, tarPath string) 
 	tw := tar.NewWriter(tf)
 	defer tw.Close()
 	
-	for relPath, snapshot := range delta {
+	for relPath := range delta {
 		fullPath := filepath.Join(root, relPath)
 		info, err := os.Stat(fullPath)
 		if err != nil {

@@ -280,3 +280,18 @@ func fileToDigest(filePath string) (string, error) {
 	hexStr := hex.EncodeToString(h.Sum(nil))
 	return "sha256:" + hexStr, nil
 }
+// ============================================================================
+// EXPORTED WRAPPERS FOR BUILDER
+// ============================================================================
+
+// RunInContainerForBuild wraps RunInContainer for use by builder
+// Executes a shell command in the assembled container root and captures delta layer
+func RunInContainerForBuild(root, cmd, workdir string, env []string) (string, error) {
+	return RunInContainer(root, cmd, workdir, env)
+}
+
+// RunContainerForegroundForCLI wraps RunContainerForeground for use by CLI
+// Executes a container in foreground for the `docksmith run` command
+func RunContainerForegroundForCLI(root string, cmd []string, workdir string, env []string) (int, error) {
+	return RunContainerForeground(root, cmd, workdir, env)
+}
